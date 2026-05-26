@@ -32,7 +32,7 @@ KERNEL_C_SRCS := \
 
 KERNEL_S_SRCS := \
 	kernel/entry.S \
-	kernel/trap.S \
+	kernel/trapvec.S \
 	kernel/swtch.S
 
 KERNEL_OBJS := \
@@ -63,7 +63,7 @@ $(BUILD)/kernel/userbins.o: kernel/userbins.S $(USER_ELFS) | $(BUILD)/kernel
 	$(CC) $(ASFLAGS) -c -o $@ $<
 
 $(BUILD)/user/%.elf: user/%.c user/syscall.c user/usys.S user/user.h user/user.ld include/syscall.h | $(BUILD)/user
-	$(CC) $(USER_FLAGS) -T user/user.ld -Wl,-z,max-page-size=4096 -o $@ user/usys.S user/syscall.c $<
+	$(CC) $(USER_FLAGS) -T user/user.ld -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=4096 -o $@ user/usys.S user/syscall.c $<
 
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 	$(CC) $(CFLAGS) -T kernel/linker.ld -Wl,-z,max-page-size=4096 -o $@ $(KERNEL_OBJS)
@@ -71,8 +71,8 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 $(KERNEL_BIN): $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $< $@
 
-run: $(KERNEL_ELF)
-	$(QEMU) -machine virt -bios default -m 128M -smp 1 -nographic -kernel $(KERNEL_ELF)
+run: $(KERNEL_BIN)
+	$(QEMU) -machine virt -bios default -m 128M -smp 1 -nographic -kernel $(KERNEL_BIN)
 
 test:
 	sh scripts/run_tests.sh

@@ -17,5 +17,5 @@ _entry:
 .section .bss
 .align 12
 boot_stack:
-  .space 4096 * 4
+  .space 4096
 boot_stack_top:
