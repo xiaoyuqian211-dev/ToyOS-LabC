@@ -39,6 +39,670 @@ ToyOS 完成内核初始化
 
 ---
 
+## 以 `write()` 系统调用为例
+
+在 ToyOS-LabC 中，`trap` 是用户态进入内核态的统一入口机制。用户程序不能直接访问内核数据结构、页表、设备和进程表，因此当用户程序需要输出字符、退出进程、创建进程、读文件等服务时，需要通过系统调用进入内核。
+
+以 `write()` 系统调用为例，它的完整执行流程如下：
+
+```text
+用户程序调用 write()
+    ↓
+user/syscall.c 中的 write() 封装函数
+    ↓
+do_syscall() 将参数放入 a0-a5，将系统调用号放入 a7
+    ↓
+执行 ecall 指令
+    ↓
+CPU 触发 trap，跳转到 stvec 指向的 trap_entry
+    ↓
+trapvec.S 保存用户态寄存器到 trapframe
+    ↓
+切换到内核页表和内核栈
+    ↓
+调用 trap_dispatch()
+    ↓
+trap_dispatch() 根据 scause 判断这是用户态 ecall
+    ↓
+调用 syscall_dispatch()
+    ↓
+syscall_dispatch() 根据 a7 中的系统调用号找到 SYS_write
+    ↓
+调用 sys_write()
+    ↓
+sys_write() 从用户地址空间读取字符串，并通过 console_putchar() 输出
+    ↓
+返回值写回 trapframe->a0
+    ↓
+trap_return() 和 userret 恢复用户现场
+    ↓
+sret 返回用户态
+```
+
+---
+
+### 1. 用户态 `write()` 封装
+
+用户程序调用的 `write()` 并不会直接访问终端设备，而是调用 `do_syscall()`，通过 `ecall` 主动陷入内核。
+
+```c
+// user/syscall.c
+
+static long do_syscall(long num,
+                       long a0, long a1, long a2,
+                       long a3, long a4, long a5) {
+    register long x0 asm("a0") = a0;
+    register long x1 asm("a1") = a1;
+    register long x2 asm("a2") = a2;
+    register long x3 asm("a3") = a3;
+    register long x4 asm("a4") = a4;
+    register long x5 asm("a5") = a5;
+    register long x7 asm("a7") = num;
+
+    asm volatile("ecall"
+                 : "+r"(x0)
+                 : "r"(x1), "r"(x2), "r"(x3),
+                   "r"(x4), "r"(x5), "r"(x7)
+                 : "memory");
+
+    return x0;
+}
+
+long write(int fd, const void *buf, int n) {
+    return do_syscall(SYS_write, fd, (long)buf, n, 0, 0, 0);
+}
+```
+
+其中：
+
+```text
+a0 = fd
+a1 = buf
+a2 = n
+a7 = SYS_write
+```
+
+ToyOS 使用 RISC-V 常见的系统调用约定：
+参数放在 `a0-a5`，系统调用号放在 `a7`，返回值放回 `a0`。
+
+---
+
+### 2. 系统调用号定义
+
+`SYS_write` 在 `include/syscall.h` 中定义。用户态和内核态都使用同一套系统调用编号。
+
+```c
+// include/syscall.h
+
+#ifndef TOYOS_SYSCALL_H
+#define TOYOS_SYSCALL_H
+
+#define SYS_write    1
+#define SYS_exit     2
+#define SYS_getpid   3
+#define SYS_yield    4
+#define SYS_fork     5
+#define SYS_wait     6
+#define SYS_exec     7
+#define SYS_readfile 8
+#define SYS_info     9
+
+#endif
+```
+
+因此，当用户程序执行：
+
+```c
+write(1, "hello\n", 6);
+```
+
+本质上就是：
+
+```text
+把 fd = 1 放入 a0
+把字符串地址放入 a1
+把长度 6 放入 a2
+把 SYS_write = 1 放入 a7
+执行 ecall
+```
+
+---
+
+### 3. Trap 初始化：设置入口地址
+
+内核启动时会调用 `trapinit()`，把汇编入口 `trap_entry` 写入 RISC-V 的 `stvec` 寄存器。
+
+```c
+// kernel/trap.c
+
+void trapinit(void) {
+    w_stvec((uint64)trap_entry);
+}
+```
+
+`stvec` 的作用是保存 trap 入口地址。之后只要发生系统调用、异常或中断，CPU 就会跳转到 `trap_entry`。
+
+---
+
+### 4. 汇编入口保存用户现场
+
+`trap_entry` 位于 `kernel/trapvec.S`。当用户程序执行 `ecall` 后，CPU 会跳到这里。
+
+核心工作包括：
+
+1. 保存用户态寄存器；
+2. 保存 `sepc` 和 `sstatus`；
+3. 切换到内核页表；
+4. 切换到内核栈；
+5. 调用 C 语言的 `trap_dispatch()`。
+
+关键代码片段如下：
+
+```asm
+// kernel/trapvec.S
+
+.globl trap_entry
+trap_entry:
+    csrrw sp, sscratch, sp
+
+    sd ra, TF_RA(sp)
+    sd gp, TF_GP(sp)
+    sd tp, TF_TP(sp)
+
+    sd a0, TF_A0(sp)
+    sd a1, TF_A1(sp)
+    sd a2, TF_A2(sp)
+    sd a3, TF_A3(sp)
+    sd a4, TF_A4(sp)
+    sd a5, TF_A5(sp)
+    sd a6, TF_A6(sp)
+    sd a7, TF_A7(sp)
+
+    csrr t0, sscratch
+    sd t0, TF_SP(sp)
+
+    csrr t0, sepc
+    sd t0, TF_EPC(sp)
+
+    csrr t0, sstatus
+    sd t0, TF_STATUS(sp)
+
+    ld t0, TF_KERNEL_SATP(sp)
+    csrw satp, t0
+    sfence.vma
+
+    ld sp, TF_KERNEL_SP(sp)
+
+    call trap_dispatch
+    call trap_return
+```
+
+其中最关键的是保存 `a0-a7`，因为系统调用参数和系统调用号都在这些寄存器里。保存之后，内核就可以通过当前进程的 `trapframe` 读取这些值。
+
+---
+
+### 5. trapframe：保存用户态现场
+
+`trapframe` 是 trap 机制中非常重要的数据结构。它用来保存用户程序被 trap 打断时的寄存器状态。
+
+```c
+// include/proc.h
+
+struct trapframe {
+    uint64 ra;
+    uint64 gp;
+    uint64 tp;
+
+    uint64 t0;
+    uint64 t1;
+    uint64 t2;
+
+    uint64 s0;
+    uint64 s1;
+
+    uint64 a0;
+    uint64 a1;
+    uint64 a2;
+    uint64 a3;
+    uint64 a4;
+    uint64 a5;
+    uint64 a6;
+    uint64 a7;
+
+    uint64 s2;
+    uint64 s3;
+    uint64 s4;
+    uint64 s5;
+    uint64 s6;
+    uint64 s7;
+    uint64 s8;
+    uint64 s9;
+    uint64 s10;
+    uint64 s11;
+
+    uint64 t3;
+    uint64 t4;
+    uint64 t5;
+    uint64 t6;
+
+    uint64 sp;
+    uint64 kernel_sp;
+    uint64 epc;
+    uint64 status;
+    uint64 kernel_satp;
+};
+```
+
+对于 `write()` 系统调用来说，最关键的字段是：
+
+```text
+trapframe->a0：文件描述符 fd
+trapframe->a1：用户缓冲区地址 buf
+trapframe->a2：写入长度 n
+trapframe->a7：系统调用号 SYS_write
+trapframe->epc：返回用户态后继续执行的位置
+```
+
+---
+
+### 6. trap_dispatch：判断 trap 类型
+
+进入 C 层后，`trap_dispatch()` 会读取 `scause`，判断 trap 的原因。
+
+```c
+// kernel/trap.c
+
+void trap_dispatch(struct trapframe *tf) {
+    struct proc *p = myproc();
+
+    if (p == NULL) {
+        panic("trap without current process");
+    }
+
+    uint64 scause = r_scause();
+    uint64 code = scause & ~SCAUSE_INTERRUPT;
+
+    if ((scause & SCAUSE_INTERRUPT) == 0 && code == 8) {
+        tf->epc += 4;
+        syscall_dispatch();
+        return;
+    }
+
+    if ((scause & SCAUSE_INTERRUPT) && code == 5) {
+        printf("[ToyOS] timer interrupt pid=%d\n", p->pid);
+        proc_yield();
+        return;
+    }
+
+    if ((scause & SCAUSE_INTERRUPT) == 0) {
+        if (code == 2) {
+            printf("[ToyOS] illegal instruction in pid=%d epc=%p stval=%p\n",
+                   p->pid, (void *)tf->epc, (void *)r_stval());
+        } else if (code == 12 || code == 13 || code == 15) {
+            printf("[ToyOS] page fault in pid=%d scause=%x epc=%p stval=%p\n",
+                   p->pid, scause, (void *)tf->epc, (void *)r_stval());
+        } else {
+            printf("[ToyOS] unexpected trap pid=%d scause=%x epc=%p stval=%p\n",
+                   p->pid, scause, (void *)tf->epc, (void *)r_stval());
+        }
+
+        proc_exit(-1);
+    }
+
+    printf("[ToyOS] unhandled interrupt scause=%x\n", scause);
+}
+```
+
+这里：
+
+```c
+code == 8
+```
+
+表示这是用户态执行 `ecall` 触发的系统调用。
+
+这一句非常关键：
+
+```c
+tf->epc += 4;
+```
+
+因为 `epc` 保存的是触发 trap 的那条 `ecall` 指令地址。如果不加 4，系统调用返回用户态后还会继续执行同一条 `ecall`，导致反复陷入内核，形成死循环。所以这里要让 `epc` 跳过当前的 `ecall` 指令。
+
+---
+
+### 7. syscall_dispatch：根据 a7 分发系统调用
+
+当 `trap_dispatch()` 判断这是系统调用后，会调用：
+
+```c
+syscall_dispatch();
+```
+
+在 `kernel/syscall.c` 中，内核通过当前进程的 `trapframe->a7` 取出系统调用号。
+
+```c
+// kernel/syscall.c
+
+void syscall_dispatch(void) {
+    struct proc *p = myproc();
+    int num = (int)p->trapframe->a7;
+    int ret = -1;
+
+    switch (num) {
+    case SYS_write:
+        ret = sys_write();
+        break;
+    case SYS_exit:
+        ret = sys_exit();
+        break;
+    case SYS_getpid:
+        ret = sys_getpid();
+        break;
+    case SYS_yield:
+        ret = sys_yield();
+        break;
+    case SYS_fork:
+        ret = sys_fork();
+        break;
+    case SYS_wait:
+        ret = sys_wait();
+        break;
+    case SYS_exec:
+        ret = sys_exec();
+        break;
+    case SYS_readfile:
+        ret = sys_readfile();
+        break;
+    case SYS_info:
+        ret = sys_info();
+        break;
+    default:
+        printf("[ToyOS] unknown syscall %d from pid=%d\n", num, p->pid);
+        ret = -1;
+        break;
+    }
+
+    p->trapframe->a0 = (uint64)ret;
+}
+```
+
+对于 `write()` 来说：
+
+```text
+trapframe->a7 == SYS_write
+```
+
+所以会进入：
+
+```c
+case SYS_write:
+    ret = sys_write();
+    break;
+```
+
+处理完成后，返回值会写入：
+
+```c
+p->trapframe->a0 = (uint64)ret;
+```
+
+这样用户态 `write()` 返回时，就可以从 `a0` 中拿到返回值。
+
+---
+
+### 8. sys_write：真正完成输出
+
+`sys_write()` 是内核侧真正处理 `write()` 系统调用的函数。
+
+```c
+// kernel/syscall.c
+
+static uint64 argraw(int n) {
+    struct trapframe *tf = myproc()->trapframe;
+
+    switch (n) {
+    case 0:
+        return tf->a0;
+    case 1:
+        return tf->a1;
+    case 2:
+        return tf->a2;
+    case 3:
+        return tf->a3;
+    case 4:
+        return tf->a4;
+    case 5:
+        return tf->a5;
+    default:
+        return 0;
+    }
+}
+```
+
+`argraw()` 的作用是从 `trapframe` 中读取系统调用参数。
+
+对于：
+
+```c
+write(1, "hello\n", 6);
+```
+
+对应关系是：
+
+```text
+argraw(0) = fd = 1
+argraw(1) = ubuf = 用户态字符串地址
+argraw(2) = n = 6
+```
+
+`sys_write()` 的代码如下：
+
+```c
+// kernel/syscall.c
+
+static int sys_write(void) {
+    int fd = (int)argraw(0);
+    uint64 ubuf = argraw(1);
+    int n = (int)argraw(2);
+
+    if (fd != 1 && fd != 2) {
+        return -1;
+    }
+
+    if (n < 0) {
+        return -1;
+    }
+
+    for (int i = 0; i < n; i++) {
+        char ch;
+
+        if (copyin(myproc()->pagetable, &ch, ubuf + (uint64)i, 1) != 0) {
+            return -1;
+        }
+
+        console_putchar(ch);
+    }
+
+    return n;
+}
+```
+
+这里有两个重要细节：
+
+第一，`write()` 只允许输出到标准输出或标准错误：
+
+```c
+if (fd != 1 && fd != 2) {
+    return -1;
+}
+```
+
+第二，用户传进来的 `buf` 是用户地址空间里的地址，内核不能直接当作普通指针访问，而是要通过：
+
+```c
+copyin(myproc()->pagetable, &ch, ubuf + (uint64)i, 1)
+```
+
+从用户页表中安全地拷贝数据。
+
+每成功拷贝一个字符，就调用：
+
+```c
+console_putchar(ch);
+```
+
+把字符输出到控制台。
+
+---
+
+### 9. 返回用户态
+
+系统调用处理完成后，`trap_return()` 会准备返回用户态。
+
+```c
+// kernel/trap.c
+
+void trap_return(void) {
+    struct proc *p = myproc();
+
+    if (p == NULL || p->trapframe == NULL) {
+        panic("trap_return without process");
+    }
+
+    w_stvec((uint64)trap_entry);
+
+    uint64 x = p->trapframe->status;
+    x &= ~SSTATUS_SPP;
+    x |= SSTATUS_SPIE;
+    p->trapframe->status = x;
+
+    p->trapframe->kernel_sp = (uint64)p->kstack + PGSIZE;
+    p->trapframe->kernel_satp = make_satp(kernel_pagetable_get());
+
+    userret(p->trapframe, make_satp(p->pagetable));
+}
+```
+
+这里：
+
+```c
+x &= ~SSTATUS_SPP;
+```
+
+表示返回后进入用户态。
+
+```c
+x |= SSTATUS_SPIE;
+```
+
+表示返回用户态后恢复中断使能状态。
+
+最后调用：
+
+```c
+userret(p->trapframe, make_satp(p->pagetable));
+```
+
+切回用户进程页表，并恢复用户寄存器。
+
+---
+
+### 10. userret：恢复现场并执行 sret
+
+`userret` 位于 `trapvec.S`，负责恢复用户态现场并执行 `sret`。
+
+```asm
+// kernel/trapvec.S
+
+.globl userret
+userret:
+    csrw satp, a1
+    sfence.vma
+
+    mv t0, a0
+
+    ld t1, TF_EPC(t0)
+    csrw sepc, t1
+
+    ld t1, TF_STATUS(t0)
+    csrw sstatus, t1
+
+    csrw sscratch, t0
+
+    ld sp, TF_SP(t0)
+
+    ld ra, TF_RA(t0)
+    ld a0, TF_A0(t0)
+    ld a1, TF_A1(t0)
+    ld a2, TF_A2(t0)
+    ld a3, TF_A3(t0)
+    ld a4, TF_A4(t0)
+    ld a5, TF_A5(t0)
+    ld a6, TF_A6(t0)
+    ld a7, TF_A7(t0)
+
+    sret
+```
+
+执行到 `sret` 后，CPU 就会从内核态返回用户态，并从 `sepc` 指向的位置继续执行。由于前面在 `trap_dispatch()` 中已经执行了：
+
+```c
+tf->epc += 4;
+```
+
+所以返回后不会重复执行 `ecall`，而是继续执行系统调用之后的用户代码。
+
+---
+
+### 11. 总结
+
+以 `write()` 为例，ToyOS-LabC 的 trap + syscall 机制可以总结为：
+
+```text
+write()
+    ↓
+do_syscall()
+    ↓
+ecall
+    ↓
+trap_entry 保存现场
+    ↓
+trap_dispatch 判断 scause
+    ↓
+syscall_dispatch 根据 a7 分发
+    ↓
+sys_write 通过 copyin 读取用户缓冲区
+    ↓
+console_putchar 输出字符
+    ↓
+返回值写入 a0
+    ↓
+trap_return / userret 恢复现场
+    ↓
+sret 返回用户态
+```
+
+所以，trap 的核心作用就是：
+**让用户程序以受控、安全的方式进入内核，请求内核提供系统服务。**
+
+在 `write()` 这个例子中，用户程序只是执行了一个普通的 `write()` 函数，但背后实际上经历了：
+
+```text
+用户态函数封装
+参数寄存器传递
+ecall 触发 trap
+汇编保存现场
+C 层 trap 分发
+系统调用分发
+内核安全访问用户地址
+控制台输出
+恢复现场并返回用户态
+```
+
+这就是 ToyOS-LabC 中系统调用和 trap 机制的完整实现流程。
+
+
 ## 2. 项目定位
 
 本项目是面向操作系统课程实验的教学型 OS 内核，目标是帮助理解：
